@@ -21,14 +21,15 @@ np.random.seed(42)
 torch.manual_seed(42)
 
 IMG_H, IMG_W = 256, 256
-OUT_DIM = 6          # 【修改】[光板X, 光板Y, 光板H, 有图X, 有图Y, 有图H]
-EPOCHS = 200
+OUT_DIM = 6          # [光板X, 光板Y, 光板H, 有图X, 有图Y, 有图H]
+EPOCHS = 150         # 建议先跑150轮观察
 BATCH_SIZE = 32
 LR_PHASE1 = 1e-4
-LR_PHASE2 = 5e-5
 MIN_LR = 1e-6
 DIAG_THRESHOLD = 0.5
 UNCERTAINTY_WEIGHT = 0.2
+
+# 动态损失权重
 DYNAMIC_WEIGHT_INIT_CLS = 0.8
 DYNAMIC_WEIGHT_FINAL_CLS = 0.2
 DYNAMIC_WARMUP_EPOCHS = 100
@@ -44,7 +45,6 @@ def load_dataset():
     y_cls = data['labels_cls'].astype(np.int64)     # (N, 6)
 
     # 提取有效数据的掩码，用于忽略无图形区域的 0.0 占位符
-    # 数据本身X/Y/H不可能为0，因此值为0即代表占位符
     domain_mask = (y_reg != 0.0).astype(np.float32)
 
     reg_min = np.zeros(OUT_DIM, dtype=np.float32)
@@ -67,7 +67,6 @@ def load_dataset():
     m, s = x.mean(), x.std() + 1e-6
     x = (x - m) / s
 
-    # 移除 ls_onehot 返回项，新增 domain_mask 以精准屏蔽非激活损失
     return x, y_cls.astype(np.float32), y_reg_norm, domain_mask, reg_min, reg_max
 
 
@@ -138,7 +137,6 @@ class EncoderBackbone(nn.Module):
         self.fusion = nn.Sequential(nn.Linear(2048 + 512, 2560, bias=False), nn.BatchNorm1d(2560), nn.ReLU(inplace=True))
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
-    # 【修改】去掉 ls_onehot，仅依靠6维解耦自我识别
     def forward(self, x):
         stem_out = self.stem(x)
         res_out = self.global_pool(self.res4(self.res3(self.res2(self.res1(stem_out))))).flatten(1)  
@@ -158,12 +156,19 @@ class ResVGG_DualBranch(nn.Module):
         feat = self.encoder(x)                                   
         diag_logits = self.diag_head(feat)                                  
         diag_prob   = torch.sigmoid(diag_logits)                            
+        
         reg_signal  = diag_prob.detach() if detach_diag_for_reg else diag_prob
-        hard_gate   = (diag_prob.detach() >= DIAG_THRESHOLD).float()
-        gate        = hard_gate if not self.training else reg_signal        
         esti_in     = torch.cat([feat, reg_signal], dim=1)
-        return diag_logits, torch.sigmoid(self.reg_head(esti_in)) * gate, \
-               (F.softplus(self.uncert_head(esti_in)) + 1e-4) * gate + 1e-4
+        
+        pe_raw = torch.sigmoid(self.reg_head(esti_in))
+        uncert_raw = F.softplus(self.uncert_head(esti_in)) + 1e-4
+
+        # 【核心修正】训练期让梯度畅通无阻，只在推断期套上 hard_gate
+        if not self.training:
+            hard_gate = (diag_prob >= DIAG_THRESHOLD).float()
+            return diag_logits, pe_raw * hard_gate, uncert_raw * hard_gate
+        else:
+            return diag_logits, pe_raw, uncert_raw
 
 class DirectRegResVGG(nn.Module):
     def __init__(self):
@@ -191,15 +196,19 @@ def train_model(model, train_loader, val_loader, reg_min, reg_max, model_name="D
     optimizer = optim.Adam(model.parameters(), lr=LR_PHASE1)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=MIN_LR)
     
-    # 【新增】基于实际数据集自动动态计算列级别的 pos_weight，防范样本稀缺崩溃
+    # 【核心修正】只在激活的 Domain 内部统计真实的正负样本比例，防止 pos_weight 爆炸
     ds_cls = train_loader.dataset.d
+    ds_m = train_loader.dataset.m
     pos_w_list = []
     for i in range(OUT_DIM):
-        pos_cnt = (ds_cls[:, i] == 1).sum().item()
-        neg_cnt = (ds_cls[:, i] == 0).sum().item()
-        pos_w_list.append(neg_cnt / max(pos_cnt, 1.0))
+        valid_mask = (ds_m[:, i] == 1)
+        valid_cls = ds_cls[valid_mask, i]
+        pos_cnt = max((valid_cls == 1).sum().item(), 1.0) # 防除零
+        neg_cnt = (valid_cls == 0).sum().item()
+        pos_w_list.append(neg_cnt / pos_cnt)
     
-    bce_logits = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w_list, device=device))
+    # 算分类损失时，使用 reduction='none' 方便我们后续用掩码 m 把废弃维度遮挡掉
+    bce_logits = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_w_list, device=device), reduction='none')
 
     for ep in range(EPOCHS):
         model.train()
@@ -208,18 +217,20 @@ def train_model(model, train_loader, val_loader, reg_min, reg_max, model_name="D
         for x, d, e, m in train_loader:
             x, d, e, m = x.to(device), d.to(device), e.to(device), m.to(device)
             optimizer.zero_grad()
+            
             if is_dual:
                 diag_logits, pe, sigma = model(x)
-                diag_prob = torch.sigmoid(diag_logits.detach())
                 
-                # 双重保护：仅在有物理意义的数据域上施加MAE惩罚
-                eff_mask = diag_prob * m 
-                loss = cls_w * bce_logits(diag_logits, d) + reg_w * (
-                    soft_masked_mae_loss(pe, e, eff_mask) +
-                    UNCERTAINTY_WEIGHT * soft_masked_uncertainty_mae(sigma, pe, e, eff_mask))
+                # 【核心修正】精准掩盖占位符，不让 BCE 去强制约束不属于当前光板/有图域的神经元
+                bce_unreduced = bce_logits(diag_logits, d)
+                loss_cls = (bce_unreduced * m).sum() / m.sum().clamp_min(1.0)
+                
+                # 回归损失直接在真实激活域 (m) 上计算，保证梯度畅通
+                loss_reg = soft_masked_mae_loss(pe, e, m) + UNCERTAINTY_WEIGHT * soft_masked_uncertainty_mae(sigma, pe, e, m)
+                
+                loss = cls_w * loss_cls + reg_w * loss_reg
             else:
                 _, pe, _ = model(x)
-                # 直接回归通过 m 阻止未激活域的梯度流出
                 mse_unreduced = F.mse_loss(pe, e, reduction='none')
                 loss = (mse_unreduced * m).sum() / m.sum().clamp_min(1.0)
                 
@@ -230,6 +241,7 @@ def train_model(model, train_loader, val_loader, reg_min, reg_max, model_name="D
         if (ep + 1) % 10 == 0:
             val_acc, val_mae = evaluate_model(model, val_loader, reg_min, reg_max, is_dual)
             print(f"[{model_name}] Epoch {ep + 1:4d} | Acc: {val_acc:.4f} | MAE: {val_mae:.4f}")
+            
     return evaluate_model(model, val_loader, reg_min, reg_max, is_dual)
 
 def evaluate_model(model, loader, reg_min, reg_max, is_dual=True):
@@ -249,15 +261,15 @@ def evaluate_model(model, loader, reg_min, reg_max, is_dual=True):
                 diag_prob = torch.sigmoid(diag_logits)
                 pred_cls  = (diag_prob >= DIAG_THRESHOLD).float()
                 
-                # 在分类计算中，依靠域掩码 m 将 0-占位符位进行屏蔽（占位符准确率是100%没意义的）
                 valid_preds = (pred_cls == d).float() * m
                 accs.append(valid_preds.sum().item() / m.sum().item() if m.sum() > 0 else 0)
                 
-                # 回归 MAE 依然只统计实际有偏差的地方 (且属于激活域)
+                # MAE 只在真实发生了变化的缺陷位 (d=1) 且属于物理有效域 (m=1) 上统计
                 col_mask = (d > DIAG_THRESHOLD) * m                          
             else:
                 _, pe, _ = model(x)
                 accs.append(0.0)
+                # Baseline没有分类概率，只要标签是非基准值 (e>0) 就算 MAE
                 col_mask = (e > 0) * m                                       
 
             pe_phys = pe * t_rng + t_min   
@@ -281,7 +293,6 @@ def plot_confusion_matrix(model, loader):
             diag_logits, _, _ = model(x.to(device))
             pd = torch.sigmoid(diag_logits)
             
-            # 只抽取当前激活域内的真实标签来进行混淆矩阵统计
             mask_cpu = m.cpu().numpy() == 1
             all_true.extend(d.cpu().numpy()[mask_cpu])
             all_pred.extend((pd.cpu().numpy()[mask_cpu] > DIAG_THRESHOLD).astype(int))
